@@ -21,7 +21,7 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 site_notes = []
 site_photos = []
 
-# 3. إعداد مفاتيح التشغيل وتنظيفها من أي مسافات
+# 3. إعداد مفاتيح التشغيل وتنظيفها من أي مسافات زائدة تلقائياً
 ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
 TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
@@ -38,7 +38,7 @@ def transcribe_audio(file_path):
         return None, "لم يتم ضبط مفتاح GROQ_API_KEY في إعدادات البيئة (Render)."
     
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    api_url = "[suspicious link removed]"
+    api_url = "[suspicious link removed]".strip()
     
     try:
         with open(file_path, "rb") as f:
