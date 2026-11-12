@@ -26,6 +26,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
+def safe_latin_text(text):
+    """تنظيف النص من الحروف غير المدعومة في خط Helvetica لتجنب الانهيار"""
+    return text.encode('latin-1', 'ignore').decode('latin-1')
+
 # 4. دالة توليد تقرير PDF يحتوي على الصور الميدانية
 class PDFReport(FPDF):
     def header(self):
@@ -53,7 +57,9 @@ def generate_pdf_report(summary_text, notes_list, photos_list):
     
     pdf.set_font("Helvetica", "", 10)
     if notes_list:
-        clean_notes = "\n".join([f"- {note}" for note in notes_list])
+        clean_notes = "\n".join([f"- {safe_latin_text(note)}" for note in notes_list])
+        if not clean_notes.strip():
+            clean_notes = "Site notes recorded (Arabic text saved for message report)."
         pdf.multi_cell(0, 6, clean_notes)
     else:
         pdf.cell(0, 6, "No text notes recorded today.", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
@@ -68,7 +74,8 @@ def generate_pdf_report(summary_text, notes_list, photos_list):
     if photos_list:
         for idx, photo in enumerate(photos_list, 1):
             pdf.set_font("Helvetica", "B", 10)
-            caption_text = f"Photo #{idx} [{photo['timestamp']}]: {photo['caption']}"
+            safe_caption = safe_latin_text(photo['caption']) or "Photo Note"
+            caption_text = f"Photo #{idx} [{photo['timestamp']}]: {safe_caption}"
             pdf.cell(0, 6, caption_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.ln(2)
             
@@ -149,17 +156,21 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             summary_text += f"\n\n(ملاحظة: تعذر استدعاء الذكاء الاصطناعي للصياغة: {e})"
     
-    pdf_path = generate_pdf_report(summary_text, site_notes, site_photos)
-    
+    # إرسال التقرير النصي أولاً دائماً لضمان وصوله للمستخدم
     await update.message.reply_text(summary_text)
     
-    if os.path.exists(pdf_path):
-        with open(pdf_path, "rb") as pdf_file:
-            await update.message.reply_document(
-                document=pdf_file,
-                filename=os.path.basename(pdf_path),
-                caption="📄 التقرير اليومي الميداني المنسق (PDF) مدمجاً به الصور الميدانية."
-            )
+    # توليد وإرسال ملف PDF بحماية لتجنب أي توقف
+    try:
+        pdf_path = generate_pdf_report(summary_text, site_notes, site_photos)
+        if os.path.exists(pdf_path):
+            with open(pdf_path, "rb") as pdf_file:
+                await update.message.reply_document(
+                    document=pdf_file,
+                    filename=os.path.basename(pdf_path),
+                    caption="📄 التقرير اليومي الميداني المنسق (PDF) مدمجاً به الصور الميدانية."
+                )
+    except Exception as pdf_err:
+        await update.message.reply_text(f"⚠️ تم إرسال التقرير النصي بنجاح، وتوقف توليد الـ PDF فقط بسبب: {pdf_err}")
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global site_notes, site_photos
