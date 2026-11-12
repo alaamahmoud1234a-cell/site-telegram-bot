@@ -1,3 +1,2 @@
 anthropic
 python-telegram-bot
-openai-whisper
