@@ -54,7 +54,56 @@ def transcribe_audio(file_path):
     except Exception as e:
         return None, str(e)
 
-# 5. دالة توليد تقرير PDF
+# 5. دالة توليد صياغة التقرير بالذكاء الاصطناعي (دعم مزدوج: Anthropic + Groq)
+def generate_ai_summary(prompt):
+    # الخيار 1: استدعاء Anthropic Claude
+    if client:
+        models_to_try = [
+            "claude-3-5-sonnet-20240620",
+            "claude-3-5-sonnet-latest",
+            "claude-3-opus-20240229",
+            "claude-3-haiku-20240307"
+        ]
+        for model_name in models_to_try:
+            try:
+                response = client.messages.create(
+                    model=model_name,
+                    max_tokens=1000,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return response.content[0].text, None
+            except Exception:
+                continue
+
+    # الخيار 2: الاحتياطي عبر Groq LLM (سريع، مجاني، ومفتاحه مضاف بالفعل)
+    if GROQ_API_KEY:
+        try:
+            domain = "api.groq.com"
+            path = "/openai/v1/chat/completions"
+            api_url = f"https://{domain}{path}"
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1000
+            }
+            res = requests.post(api_url, headers=headers, json=payload, timeout=30)
+            if res.status_code == 200:
+                return res.json()["choices"][0]["message"]["content"], None
+            else:
+                payload["model"] = "llama-3.1-8b-instant"
+                res2 = requests.post(api_url, headers=headers, json=payload, timeout=30)
+                if res2.status_code == 200:
+                    return res2.json()["choices"][0]["message"]["content"], None
+        except Exception as e:
+            return None, str(e)
+            
+    return None, "تعذر استدعاء الذكاء الاصطناعي للصياغة."
+
+# 6. دالة توليد تقرير PDF
 class PDFReport(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 16)
@@ -117,7 +166,7 @@ def generate_pdf_report(summary_text, notes_list, photos_list):
     pdf.output(pdf_path)
     return pdf_path
 
-# 6. معالجات تليجرام
+# 7. معالجات تليجرام
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "🏗️ **مرحباً بك في وكيل الملاحظات والتقارير الميدانية!**\n\n"
@@ -182,26 +231,11 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notes_text = "\n".join(site_notes)
     prompt = f"قم بصياغة تقرير ميداني تنفيذي منسق ومحترف باللغة العربية بناءً على الملاحظات التالية:\n\n{notes_text}"
     
-    summary_text = "التقرير الميداني اليومي:\n" + notes_text
-    if client:
-        # محاولة النماذج المعتمدة بالترتيب لضمان النجاح التام
-        models_to_try = ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-haiku-20240307"]
-        success = False
-        last_error = ""
-        for model_name in models_to_try:
-            try:
-                response = client.messages.create(
-                    model=model_name,
-                    max_tokens=1000,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                summary_text = response.content[0].text
-                success = True
-                break
-            except Exception as e:
-                last_error = e
-        if not success:
-            summary_text += f"\n\n(ملاحظة: تعذر استدعاء الذكاء الاصطناعي للصياغة: {last_error})"
+    ai_summary, err = generate_ai_summary(prompt)
+    if ai_summary:
+        summary_text = f"📋 **التقرير الميداني اليومي (منسق بالذكاء الاصطناعي):**\n\n{ai_summary}"
+    else:
+        summary_text = "📋 **التقرير الميداني اليومي:**\n\n" + notes_text + f"\n\n(ملاحظة: {err})"
     
     await update.message.reply_text(summary_text)
     
