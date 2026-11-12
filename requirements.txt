@@ -3,3 +3,5 @@ python-telegram-bot
 fpdf2
 Pillow
 requests
+arabic-reshaper
+python-bidi
