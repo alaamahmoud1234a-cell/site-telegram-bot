@@ -21,7 +21,7 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 site_notes = []
 site_photos = []
 
-# 3. إعداد مفاتيح التشغيل مع إزالة أي مسافات زائدة تلقائياً
+# 3. إعداد مفاتيح التشغيل وتنظيفها من أي مسافات
 ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
 TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
@@ -44,7 +44,7 @@ def transcribe_audio(file_path):
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "audio/ogg")}
             data = {"model": "whisper-large-v3", "language": "ar"}
-            res = requests.post(api_url, headers=headers, files=files, data=data)
+            res = requests.post(api_url, headers=headers, files=files, data=data, timeout=30)
             if res.status_code == 200:
                 return res.json().get("text", ""), None
             else:
@@ -201,7 +201,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(
                     document=pdf_file,
                     filename=os.path.basename(pdf_path),
-                    caption="📄 التقرير اليومي الميداني المنسق (PDF) مدمجاً به الصور الميدانية."
+                    caption="📄 التقرير اليومي الميداني المنسق (PDF) مدمجاً به الصور الميدانية.",
+                    read_timeout=60,
+                    write_timeout=60
                 )
     except Exception as pdf_err:
         await update.message.reply_text(f"⚠️ تم إرسال التقرير النصي بنجاح، وتوقف الـ PDF بسبب: {pdf_err}")
