@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import datetime
 import threading
@@ -9,6 +10,12 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 import anthropic
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
+from arabic_reshaper import reshape
+
+try:
+    from bidi import get_display
+except ImportError:  # الإصدارات القديمة من python-bidi
+    from bidi.algorithm import get_display
 
 
 # 1. خادم صحي بسيط لمنصة Render (يرد "OK" فقط، ولا يعرض ملفات السيرفر)
@@ -50,10 +57,6 @@ ANTHROPIC_FALLBACKS = ["claude-haiku-5-5"]
 GROQ_BASE = "https://api.groq.com/openai/v1"
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
-
-
-def safe_latin_text(text):
-    return text.encode("latin-1", "ignore").decode("latin-1")
 
 
 # 4. تحويل الصوت إلى نص (Groq Whisper)
@@ -148,13 +151,61 @@ def generate_ai_summary(prompt):
     return None, error_details
 
 
-# 6. تقرير PDF
+# 6. تقرير PDF (بخط عربي)
+FONT_FAMILY = "Amiri"
+FONT_REGULAR = os.path.join("fonts", "Amiri-Regular.ttf")
+FONT_BOLD = os.path.join("fonts", "Amiri-Bold.ttf")
+
+# إزالة الإيموجي ورموز الماركداون لأن الخط لا يحتويها
+_EMOJI_RE = re.compile("[\U00010000-\U0010FFFF\u2600-\u27BF\uFE0F\u200D]")
+
+
+def clean_text(text):
+    text = _EMOJI_RE.sub("", text)
+    text = text.replace("**", "").replace("__", "")
+    text = re.sub(r"^\s*#+\s*", "", text, flags=re.M)
+    text = re.sub(r"^\s*[-*]\s+", "- ", text, flags=re.M)
+    return text
+
+
+def ar(text):
+    """تشكيل الحروف العربية وترتيبها من اليمين لليسار للعرض في PDF."""
+    return get_display(reshape(text), base_dir="R")
+
+
+def wrap_rtl(pdf, text, max_w):
+    """يقسم النص إلى أسطر أولاً بترتيبه المنطقي، ثم يشكّل كل سطر على حدة."""
+    lines = []
+    for para in text.split("\n"):
+        para = para.strip()
+        if not para:
+            lines.append("")
+            continue
+        current = ""
+        for word in para.split():
+            candidate = f"{current} {word}".strip()
+            if current and pdf.get_string_width(ar(candidate)) > max_w:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        lines.append(current)
+    return [ar(line) if line else "" for line in lines]
+
+
+def write_rtl(pdf, text, size=12, style="", line_h=7):
+    pdf.set_font(FONT_FAMILY, style, size)
+    for line in wrap_rtl(pdf, clean_text(text), pdf.epw):
+        pdf.cell(0, line_h, line, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
+
+
 class PDFReport(FPDF):
     def header(self):
-        self.set_font("Helvetica", "B", 16)
-        self.cell(0, 10, "Daily Construction Site Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+        self.set_font(FONT_FAMILY, "B", 18)
+        self.cell(0, 10, ar("تقرير موقع الإنشاءات اليومي"),
+                  new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
         self.set_font("Helvetica", "I", 10)
-        self.cell(0, 8, f"Date: {datetime.date.today().strftime('%Y-%m-%d')}",
+        self.cell(0, 8, datetime.date.today().strftime("%Y-%m-%d"),
                   new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
         self.line(10, 30, 200, 30)
         self.ln(10)
@@ -165,46 +216,48 @@ class PDFReport(FPDF):
         self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", align="C")
 
 
-def generate_pdf_report(summary_text, notes_list, photos_list):
+def generate_pdf_report(ai_summary, notes_list, photos_list):
+    if not os.path.exists(FONT_REGULAR):
+        raise FileNotFoundError(f"ملف الخط العربي غير موجود: {FONT_REGULAR}")
+
     pdf = PDFReport()
+    pdf.add_font(FONT_FAMILY, "", FONT_REGULAR)
+    # إن لم يوجد الخط العريض نستخدم العادي بدلاً منه
+    pdf.add_font(FONT_FAMILY, "B", FONT_BOLD if os.path.exists(FONT_BOLD) else FONT_REGULAR)
     pdf.alias_nb_pages()
     pdf.add_page()
 
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 8, "1. Executive Summary & Site Log:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    # 1. الملخص التنفيذي
+    write_rtl(pdf, "١. الملخص التنفيذي", size=15, style="B", line_h=9)
     pdf.ln(2)
-
-    pdf.set_font("Helvetica", "", 10)
-    if notes_list:
-        clean_notes = "\n".join(f"- {safe_latin_text(n)}" for n in notes_list)
-        if not clean_notes.replace("-", "").strip():
-            clean_notes = "Site notes recorded (Arabic text saved for message report)."
-        pdf.multi_cell(0, 6, clean_notes)
-    else:
-        pdf.cell(0, 6, "No text notes recorded today.", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
+    write_rtl(pdf, ai_summary if ai_summary else "لا يوجد ملخص آلي لهذا اليوم.", size=12)
     pdf.ln(8)
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 8, "2. Field Photos Gallery:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(4)
 
+    # 2. سجل الملاحظات
+    write_rtl(pdf, "٢. سجل الملاحظات", size=15, style="B", line_h=9)
+    pdf.ln(2)
+    if notes_list:
+        write_rtl(pdf, "\n".join(f"- {n}" for n in notes_list), size=11, line_h=6.5)
+    else:
+        write_rtl(pdf, "لا توجد ملاحظات مسجلة اليوم.", size=11)
+    pdf.ln(8)
+
+    # 3. معرض الصور
+    write_rtl(pdf, "٣. الصور الميدانية", size=15, style="B", line_h=9)
+    pdf.ln(4)
     if photos_list:
         for idx, photo in enumerate(photos_list, 1):
-            pdf.set_font("Helvetica", "B", 10)
-            safe_caption = safe_latin_text(photo["caption"]) or "Photo Note"
-            pdf.cell(0, 6, f"Photo #{idx} [{photo['timestamp']}]: {safe_caption}",
-                     new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            caption = f"صورة {idx} [{photo['timestamp']}]: {photo['caption']}"
+            write_rtl(pdf, caption, size=11, style="B", line_h=6.5)
             pdf.ln(2)
             if os.path.exists(photo["path"]):
                 try:
-                    pdf.image(photo["path"], w=120)
+                    pdf.image(photo["path"], x=(pdf.w - 120) / 2, w=120)
                 except Exception as e:
-                    pdf.set_font("Helvetica", "I", 9)
-                    pdf.cell(0, 6, f"(Error rendering image: {e})", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                    write_rtl(pdf, f"(تعذر عرض الصورة: {e})", size=9)
             pdf.ln(8)
     else:
-        pdf.set_font("Helvetica", "", 10)
-        pdf.cell(0, 6, "No field photos uploaded today.", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        write_rtl(pdf, "لا توجد صور ميدانية اليوم.", size=11)
 
     os.makedirs("reports", exist_ok=True)
     pdf_path = f"reports/Site_Report_{datetime.date.today().strftime('%Y%m%d')}.pdf"
@@ -291,7 +344,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(summary_text[i:i + 4000])
 
     try:
-        pdf_path = await asyncio.to_thread(generate_pdf_report, summary_text, site_notes, site_photos)
+        pdf_path = await asyncio.to_thread(generate_pdf_report, ai_summary, site_notes, site_photos)
         if os.path.exists(pdf_path):
             with open(pdf_path, "rb") as pdf_file:
                 await update.message.reply_document(
