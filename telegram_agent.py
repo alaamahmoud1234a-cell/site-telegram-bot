@@ -1,4 +1,15 @@
 import os
+import threading
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+
+# سيرفر خفيف لتجاوز فحص المنفذ في منصة Render
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    httpd = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
+    httpd.serve_forever()
+
+threading.Thread(target=run_dummy_server, daemon=True).start()
+import os
 import datetime
 from anthropic import Anthropic
 from telegram import Update
