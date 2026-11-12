@@ -38,8 +38,6 @@ def transcribe_audio(file_path):
         return None, "لم يتم ضبط مفتاح GROQ_API_KEY في إعدادات البيئة (Render)."
     
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    
-    # تركيب الرابط برمجياً لضمان السلامة من التنسيقات والمسافات
     domain = "api.groq.com"
     path = "/openai/v1/audio/transcriptions"
     api_url = f"https://{domain}{path}"
@@ -186,15 +184,24 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     summary_text = "التقرير الميداني اليومي:\n" + notes_text
     if client:
-        try:
-            response = client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=1000,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            summary_text = response.content[0].text
-        except Exception as e:
-            summary_text += f"\n\n(ملاحظة: تعذر استدعاء الذكاء الاصطناعي للصياغة: {e})"
+        # محاولة النماذج المعتمدة بالترتيب لضمان النجاح التام
+        models_to_try = ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-haiku-20240307"]
+        success = False
+        last_error = ""
+        for model_name in models_to_try:
+            try:
+                response = client.messages.create(
+                    model=model_name,
+                    max_tokens=1000,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                summary_text = response.content[0].text
+                success = True
+                break
+            except Exception as e:
+                last_error = e
+        if not success:
+            summary_text += f"\n\n(ملاحظة: تعذر استدعاء الذكاء الاصطناعي للصياغة: {last_error})"
     
     await update.message.reply_text(summary_text)
     
