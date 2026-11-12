@@ -2,6 +2,7 @@ import os
 import datetime
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
@@ -16,21 +17,41 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# 2. البيانات المخزنة مؤقتاً للملاحظات والصور
+# 2. السجلات المؤقتة للملاحظات والصور
 site_notes = []
 site_photos = []
 
 # 3. إعداد مفاتيح التشغيل
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 def safe_latin_text(text):
-    """تنظيف النص من الحروف غير المدعومة في خط Helvetica لتجنب الانهيار"""
-    return text.encode('latin-1', 'ignore').decode('latin-1')
+    """تنظيف النص لتجنب مشاكل خطوط PDF"""
+    return text.encode("latin-1", "ignore").decode("latin-1")
 
-# 4. دالة توليد تقرير PDF يحتوي على الصور الميدانية
+# 4. دالة تحويل الصوت إلى نص باستخدام Groq Whisper API
+def transcribe_audio(file_path):
+    if not GROQ_API_KEY:
+        return None, "لم يتم ضبط مفتاح GROQ_API_KEY في إعدادات البيئة (Render)."
+    
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    try:
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "audio/ogg")}
+            data = {"model": "whisper-large-v3", "language": "ar"}
+            api_url = "[suspicious link removed]"
+            res = requests.post(api_url, headers=headers, files=files, data=data)
+            if res.status_code == 200:
+                return res.json().get("text", ""), None
+            else:
+                return None, f"خطأ من المزود ({res.status_code})"
+    except Exception as e:
+        return None, str(e)
+
+# 5. دالة توليد تقرير PDF
 class PDFReport(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 16)
@@ -50,14 +71,13 @@ def generate_pdf_report(summary_text, notes_list, photos_list):
     pdf.alias_nb_pages()
     pdf.add_page()
     
-    # قسم الملاحظات والملخص التنفيذي
     pdf.set_font("Helvetica", "B", 13)
     pdf.cell(0, 8, "1. Executive Summary & Site Log:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(2)
     
     pdf.set_font("Helvetica", "", 10)
     if notes_list:
-        clean_notes = "\n".join([f"- {safe_latin_text(note)}" for note in notes_list])
+        clean_notes = "\n".join([f"- {safe_latin_text(n)}" for n in notes_list])
         if not clean_notes.strip():
             clean_notes = "Site notes recorded (Arabic text saved for message report)."
         pdf.multi_cell(0, 6, clean_notes)
@@ -66,7 +86,6 @@ def generate_pdf_report(summary_text, notes_list, photos_list):
     
     pdf.ln(8)
     
-    # قسم الصور الميدانية
     pdf.set_font("Helvetica", "B", 13)
     pdf.cell(0, 8, "2. Field Photos Gallery:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(4)
@@ -74,14 +93,14 @@ def generate_pdf_report(summary_text, notes_list, photos_list):
     if photos_list:
         for idx, photo in enumerate(photos_list, 1):
             pdf.set_font("Helvetica", "B", 10)
-            safe_caption = safe_latin_text(photo['caption']) or "Photo Note"
+            safe_caption = safe_latin_text(photo["caption"]) or "Photo Note"
             caption_text = f"Photo #{idx} [{photo['timestamp']}]: {safe_caption}"
             pdf.cell(0, 6, caption_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.ln(2)
             
-            if os.path.exists(photo['path']):
+            if os.path.exists(photo["path"]):
                 try:
-                    pdf.image(photo['path'], w=120)
+                    pdf.image(photo["path"], w=120)
                 except Exception as e:
                     pdf.set_font("Helvetica", "I", 9)
                     pdf.cell(0, 6, f"(Error rendering image: {e})", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
@@ -95,13 +114,13 @@ def generate_pdf_report(summary_text, notes_list, photos_list):
     pdf.output(pdf_path)
     return pdf_path
 
-# 5. معالجات رسائل تليجرام
+# 6. معالجات تليجرام
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "🏗️ **مرحباً بك في وكيل الملاحظات والتقارير الميدانية!**\n\n"
-        "• أرسل الملاحظات النصية مباشرة.\n"
+        "• أرسل الملاحظات النصية أو التسجيلات الصوتية مباشرة.\n"
         "• أرسل الصور الميدانية مع التعليق عليها.\n"
-        "• أرسل الأمر `/report` لاستخراج التقرير اليومي وتوليد ملف PDF مرفق بالصور.\n"
+        "• أرسل الأمر `/report` لاستخراج التقرير اليومي وتوليد ملف PDF.\n"
         "• أرسل الأمر `/clear` لبدء يوم عمل جديد ومسح الملاحظات القديمة."
     )
     await update.message.reply_text(welcome_text)
@@ -113,6 +132,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     site_notes.append(formatted_note)
     await update.message.reply_text(f"📝 تم تسجيل الملاحظة النصية: '{text}'")
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎙️ جاري تحويل التسجيل الصوتي إلى نص عربي...")
+    
+    voice_file = await update.message.voice.get_file()
+    os.makedirs("voice_notes", exist_ok=True)
+    
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    time_stamp_str = datetime.datetime.now().strftime("%H%M%S")
+    file_path = f"voice_notes/voice_{time_stamp_str}.ogg"
+    
+    await voice_file.download_to_drive(file_path)
+    
+    transcribed_text, error = transcribe_audio(file_path)
+    
+    if transcribed_text:
+        formatted_note = f"[{timestamp}] 🎙️ ملاحظة صوتية: {transcribed_text}"
+        site_notes.append(formatted_note)
+        await update.message.reply_text(f"✅ تم تفريغ الملاحظة الصوتية بنجاح:\n\n\"{transcribed_text}\"")
+    else:
+        site_notes.append(f"[{timestamp}] 🎙️ تسجيل صوتي تم إرساله")
+        await update.message.reply_text(f"⚠️ تعذر تحويل الصوت إلى نص: {error}")
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_file = await update.message.photo[-1].get_file()
     os.makedirs("photos", exist_ok=True)
@@ -122,16 +163,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_path = f"photos/photo_{len(site_photos) + 1}_{time_stamp_str}.jpg"
     
     await photo_file.download_to_drive(file_path)
-    
     caption = update.message.caption or "صورة ميدانية بدون تعليق"
     
-    site_photos.append({
-        "path": file_path,
-        "caption": caption,
-        "timestamp": timestamp
-    })
+    site_photos.append({"path": file_path, "caption": caption, "timestamp": timestamp})
     site_notes.append(f"[{timestamp}] 📷 صورة: {caption}")
-    
     await update.message.reply_text(f"📸 تم حفظ الصورة الميدانية بنجاح: '{caption}'")
 
 async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,7 +177,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ جاري تحليل الملاحظات وتوليد التقرير وملف الـ PDF...")
     
     notes_text = "\n".join(site_notes)
-    prompt = f"قم بصياغة تقرير ميداني تنفيذي منسق ومحترف بناءً على الملاحظات والصور التالية:\n\n{notes_text}"
+    prompt = f"قم بصياغة تقرير ميداني تنفيذي منسق ومحترف باللغة العربية بناءً على الملاحظات التالية:\n\n{notes_text}"
     
     summary_text = "التقرير الميداني اليومي:\n" + notes_text
     if client:
@@ -156,10 +191,8 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             summary_text += f"\n\n(ملاحظة: تعذر استدعاء الذكاء الاصطناعي للصياغة: {e})"
     
-    # إرسال التقرير النصي أولاً دائماً لضمان وصوله للمستخدم
     await update.message.reply_text(summary_text)
     
-    # توليد وإرسال ملف PDF بحماية لتجنب أي توقف
     try:
         pdf_path = generate_pdf_report(summary_text, site_notes, site_photos)
         if os.path.exists(pdf_path):
@@ -170,7 +203,7 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption="📄 التقرير اليومي الميداني المنسق (PDF) مدمجاً به الصور الميدانية."
                 )
     except Exception as pdf_err:
-        await update.message.reply_text(f"⚠️ تم إرسال التقرير النصي بنجاح، وتوقف توليد الـ PDF فقط بسبب: {pdf_err}")
+        await update.message.reply_text(f"⚠️ تم إرسال التقرير النصي بنجاح، وتوقف الـ PDF بسبب: {pdf_err}")
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global site_notes, site_photos
@@ -187,7 +220,8 @@ if __name__ == "__main__":
         app.add_handler(CommandHandler("report", handle_report))
         app.add_handler(CommandHandler("clear", clear_command))
         app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+        app.add_handler(MessageHandler(filters.VOICE, handle_voice))
         app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         
-        print("=== بوت تليجرام يعمل الآن ومستعد لاستقبال النص والصور وتحويلها لـ PDF ===")
+        print("=== بوت تليجرام يعمل الآن ومستعد لاستقبال النص والصوت والصور ===")
         app.run_polling()
