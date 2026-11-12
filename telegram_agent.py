@@ -21,7 +21,7 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 site_notes = []
 site_photos = []
 
-# 3. إعداد مفاتيح التشغيل وتنظيفها من أي مسافات زائدة
+# 3. إعداد مفاتيح التشغيل وتنظيفها من أي مسافات زائدة تلقائياً
 ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
 TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
@@ -54,14 +54,15 @@ def transcribe_audio(file_path):
     except Exception as e:
         return None, str(e)
 
-# 5. دالة توليد صياغة التقرير بالذكاء الاصطناعي (دعم مزدوج: Anthropic + Groq)
+# 5. دالة توليد صياغة التقرير بالذكاء الاصطناعي (دعم مزدوج محصن: Anthropic + Groq)
 def generate_ai_summary(prompt):
-    # الخيار 1: استدعاء Anthropic Claude
+    errors = []
+    
+    # المحاولة 1: Anthropic Claude
     if client:
         models_to_try = [
+            "claude-3-5-sonnet-20241022",
             "claude-3-5-sonnet-20240620",
-            "claude-3-5-sonnet-latest",
-            "claude-3-opus-20240229",
             "claude-3-haiku-20240307"
         ]
         for model_name in models_to_try:
@@ -71,37 +72,42 @@ def generate_ai_summary(prompt):
                     max_tokens=1000,
                     messages=[{"role": "user", "content": prompt}]
                 )
-                return response.content[0].text, None
-            except Exception:
-                continue
+                return response.content.text, None
+            except Exception as e:
+                errors.append(f"Anthropic ({model_name}): {e}")
 
-    # الخيار 2: الاحتياطي عبر Groq LLM (سريع، مجاني، ومفتاحه مضاف بالفعل)
+    # المحاولة 2: Groq LLM (Llama 3.3 70B / Llama 3.1 8B)
     if GROQ_API_KEY:
-        try:
-            domain = "api.groq.com"
-            path = "/openai/v1/chat/completions"
-            api_url = f"https://{domain}{path}"
-            headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 1000
-            }
-            res = requests.post(api_url, headers=headers, json=payload, timeout=30)
-            if res.status_code == 200:
-                return res.json()["choices"][0]["message"]["content"], None
-            else:
-                payload["model"] = "llama-3.1-8b-instant"
-                res2 = requests.post(api_url, headers=headers, json=payload, timeout=30)
-                if res2.status_code == 200:
-                    return res2.json()["choices"][0]["message"]["content"], None
-        except Exception as e:
-            return None, str(e)
+        domain = "api.groq.com"
+        path = "/openai/v1/chat/completions"
+        api_url = f"https://{domain}{path}"
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
+        for g_model in groq_models:
+            try:
+                payload = {
+                    "model": g_model,
+                    "messages": [
+                        {"role": "system", "content": "أنت مهندس ميداني خبير. قم بصياغة تقرير تنفيذي منسق ومحترف باللغة العربية بناءً على الملاحظات المرفقة."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 1000
+                }
+                res = requests.post(api_url, headers=headers, json=payload, timeout=30)
+                if res.status_code == 200:
+                    res_json = res.json()
+                    if "choices" in res_json and len(res_json["choices"]) > 0:
+                        return res_json["choices"][0]["message"]["content"], None
+                else:
+                    errors.append(f"Groq ({g_model}): {res.status_code}")
+            except Exception as e:
+                errors.append(f"Groq ({g_model}): {e}")
             
-    return None, "تعذر استدعاء الذكاء الاصطناعي للصياغة."
+    error_details = " | ".join(errors) if errors else "لم يتم الوصول لمزود ذكاء اصطناعي مفعّل."
+    return None, error_details
 
 # 6. دالة توليد تقرير PDF
 class PDFReport(FPDF):
@@ -235,7 +241,9 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ai_summary:
         summary_text = f"📋 **التقرير الميداني اليومي (منسق بالذكاء الاصطناعي):**\n\n{ai_summary}"
     else:
-        summary_text = "📋 **التقرير الميداني اليومي:**\n\n" + notes_text + f"\n\n(ملاحظة: {err})"
+        summary_text = "📋 **التقرير الميداني اليومي:**\n\n" + notes_text
+        if err:
+            summary_text += f"\n\n(ملاحظة: {err})"
     
     await update.message.reply_text(summary_text)
     
