@@ -21,10 +21,10 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 site_notes = []
 site_photos = []
 
-# 3. إعداد مفاتيح التشغيل
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+# 3. إعداد مفاتيح التشغيل مع إزالة أي مسافات زائدة تلقائياً
+ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
@@ -38,11 +38,12 @@ def transcribe_audio(file_path):
         return None, "لم يتم ضبط مفتاح GROQ_API_KEY في إعدادات البيئة (Render)."
     
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    api_url = "[suspicious link removed]"
+    
     try:
         with open(file_path, "rb") as f:
             files = {"file": (os.path.basename(file_path), f, "audio/ogg")}
             data = {"model": "whisper-large-v3", "language": "ar"}
-            api_url = "[suspicious link removed]"
             res = requests.post(api_url, headers=headers, files=files, data=data)
             if res.status_code == 200:
                 return res.json().get("text", ""), None
