@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import asyncio
 import datetime
 import threading
@@ -69,6 +70,9 @@ _start = re.findall(r"\d+", os.environ.get("REPORT_START_NUMBER") or "")
 REPORT_START_NUMBER = int(_start[0]) if _start else 1
 COUNTER_FILE = os.path.join("data", "report_counter.json")
 
+# الأرشفة في Google Drive عبر سكريبت Google Apps Script (اختياري)
+GOOGLE_DRIVE_WEBHOOK_URL = (os.environ.get("GOOGLE_DRIVE_WEBHOOK_URL") or "").strip()
+
 ANTHROPIC_MODEL = (os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-5-5").strip()
 ANTHROPIC_FALLBACKS = ["claude-haiku-5-5"]
 GROQ_BASE = "https://api.groq.com/openai/v1"
@@ -124,6 +128,76 @@ def get_report_number():
     except Exception as e:
         print("Report counter error:", e)
         return REPORT_START_NUMBER
+
+
+# ============================================================
+# 2b. الأرشفة في Google Drive (عبر Google Apps Script)
+# ============================================================
+def drive_post(path, filename, mimetype, report_date):
+    """يرفع ملفاً واحداً إلى السكريبت. يرجع (رد_السكريبت, None) أو (None, سبب_الفشل).
+    لا نطبع رابط الويب هوك ولا نضعه في أي رسالة لأنه يعمل كمفتاح سري."""
+    last_err = "فشل غير معروف"
+    try:
+        with open(path, "rb") as f:
+            payload = {
+                "filename": filename,
+                "mimetype": mimetype,
+                "filedata": base64.b64encode(f.read()).decode("ascii"),
+                "project": PROJECT_NAME,
+                "engineer": ENGINEER_NAME or "غير محدد",
+                "date": report_date,
+            }
+    except OSError as e:
+        return None, f"تعذرت قراءة الملف ({type(e).__name__})"
+
+    for _ in range(2):  # محاولتان
+        try:
+            res = requests.post(GOOGLE_DRIVE_WEBHOOK_URL, json=payload, timeout=90)
+            if res.status_code != 200:
+                last_err = f"رد غير متوقع (HTTP {res.status_code})"
+                continue
+            try:
+                data = res.json()
+            except ValueError:
+                last_err = "رد غير متوقع من Google؛ تأكد أن الويب أب منشور بصلاحية Anyone"
+                continue
+            if isinstance(data, dict) and data.get("ok"):
+                return data, None
+            last_err = _s(data.get("error")) if isinstance(data, dict) else "رد غير مفهوم من السكريبت"
+        except Exception as e:
+            last_err = f"خطأ اتصال ({type(e).__name__})"
+    return None, last_err
+
+
+def upload_report_to_drive(pdf_path, pdf_filename, photos, report_date):
+    """يرفع الـ PDF ثم صور اليوم. يرجع ملخصاً: uploaded / failed / folder_url / error."""
+    result = {"uploaded": 0, "failed": 0, "folder_url": "", "error": ""}
+    data, err = drive_post(pdf_path, pdf_filename, "application/pdf", report_date)
+    if not data:
+        result.update(failed=1, error=err)
+        return result  # فشل الـ PDF غالباً بسبب إعداد خاطئ، فلا فائدة من محاولة الصور
+    result["uploaded"] = 1
+    result["folder_url"] = _s(data.get("folder_url"))
+
+    for p in photos:
+        if not os.path.exists(p["path"]):
+            continue
+        data, err = drive_post(p["path"], os.path.basename(p["path"]), "image/jpeg", report_date)
+        if data:
+            result["uploaded"] += 1
+            result["folder_url"] = result["folder_url"] or _s(data.get("folder_url"))
+        else:
+            result["failed"] += 1
+            result["error"] = result["error"] or err
+    return result
+
+
+def drive_status_text(drive):
+    if drive["uploaded"] and not drive["failed"]:
+        return f"☁️ تمت الأرشفة في Google Drive ({drive['uploaded']} ملف)."
+    if drive["uploaded"]:
+        return f"⚠️ تمت أرشفة {drive['uploaded']} ملف في Google Drive، وتعذر رفع {drive['failed']}: {drive['error']}"
+    return f"⚠️ تعذرت الأرشفة في Google Drive: {drive['error']}\nالتقرير سليم وقد وصلك هنا."
 
 
 # ============================================================
@@ -789,7 +863,7 @@ def generate_pdf_report(report, photos_list):
     draw_signatures(pdf)
 
     os.makedirs("reports", exist_ok=True)
-    pdf_path = f"reports/Site_Report_{now_local().strftime('%Y%m%d')}.pdf"
+    pdf_path = f"reports/Site_Report_{now_local().strftime('%Y%m%d')}_{report['number']:03d}.pdf"
     pdf.output(pdf_path)
     return pdf_path
 
@@ -864,7 +938,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(أو اعمل Reply على الصورة بالتسجيل).\n"
         "• أوامر اختيارية لتحديد القسم صراحةً:\n"
         "   /supply توريد    /labor عمالة    /issue معوق أو طلب    /weather طقس\n"
-        "• /report لاستخراج التقرير اليومي وملف PDF.\n"
+        "• /report لاستخراج التقرير اليومي وملف PDF"
+        + (" (وتُؤرشف نسخة منه مع الصور في Google Drive تلقائياً)" if GOOGLE_DRIVE_WEBHOOK_URL else "") + ".\n"
         "• /clear لبدء يوم جديد ومسح السجلات."
     )
 
@@ -986,12 +1061,17 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 read_timeout=60,
                 write_timeout=60,
             )
-        await forward_to_admin(update, context, text, pdf_path, missing_sections(report, len(site_photos)))
+        drive = None
+        if GOOGLE_DRIVE_WEBHOOK_URL:
+            drive = await asyncio.to_thread(upload_report_to_drive, pdf_path, os.path.basename(pdf_path),
+                                            list(site_photos), now_local().date().isoformat())
+            await update.message.reply_text(drive_status_text(drive))
+        await forward_to_admin(update, context, text, pdf_path, missing_sections(report, len(site_photos)), drive)
     except Exception as pdf_err:
         await update.message.reply_text(f"⚠️ تم إرسال التقرير النصي، وتوقف الـ PDF بسبب: {pdf_err}")
 
 
-async def forward_to_admin(update, context, text, pdf_path, missing):
+async def forward_to_admin(update, context, text, pdf_path, missing, drive=None):
     """إرسال نسخة من التقرير تلقائياً لمدير المشروع (ADMIN_TELEGRAM_ID)."""
     if not ADMIN_TELEGRAM_ID or ADMIN_TELEGRAM_ID == update.effective_chat.id:
         return
@@ -1000,6 +1080,11 @@ async def forward_to_admin(update, context, text, pdf_path, missing):
         notice = f"🔔 تقرير جديد من: {eng}\n🏗️ المشروع: {PROJECT_NAME}\n\n" + text
         if missing:
             notice += "\n\nأقسام غير مسجلة اليوم: " + "، ".join(missing)
+        if drive:
+            if drive["uploaded"] and drive["folder_url"]:
+                notice += f"\n\n☁️ مجلد Google Drive: {drive['folder_url']}"
+            elif not drive["uploaded"]:
+                notice += "\n\n⚠️ تعذرت أرشفة هذا التقرير في Google Drive."
         for i in range(0, len(notice), 4000):
             await context.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=notice[i:i + 4000])
         slug = re.sub(r"[^\w\-]+", "_", eng).strip("_") or "report"
