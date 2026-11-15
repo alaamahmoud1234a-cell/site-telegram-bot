@@ -61,9 +61,10 @@ GROQ_BASE = "https://api.groq.com/openai/v1"
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 site_notes = []      # [{"ts": "...", "text": "..."}]  نصوص وتسجيلات صوتية مفرّغة
-site_photos = []     # [{"path", "caption", "timestamp"}]
+site_photos = []     # [{"path", "caption", "voice", "timestamp", "msg_id"}]
 site_supplies = []   # توريدات مسجلة صراحةً بأمر /supply
-site_emails = []     # بريد وارد مسجل صراحةً بأمر /mail
+last_photo = {"idx": None, "at": None}  # آخر صورة بانتظار تعليق صوتي
+PHOTO_VOICE_WINDOW = 600  # ثوانٍ: مهلة ربط التسجيل الصوتي بالصورة السابقة
 
 
 def now_local():
@@ -176,13 +177,12 @@ def ask_ai(prompt, system):
 
 CLASSIFY_SYSTEM = "أنت مساعد لمهندس موقع إنشاءات. مهمتك تصنيف ملاحظات اليوم وإرجاعها بصيغة JSON فقط دون أي نص إضافي."
 
-CLASSIFY_PROMPT = """صنّف الملاحظات الميدانية التالية إلى ثلاث قوائم، وأعد JSON صالحاً فقط بهذا الشكل:
-{{"works": [], "supplies": [], "emails": []}}
+CLASSIFY_PROMPT = """صنّف الملاحظات الميدانية التالية إلى قائمتين، وأعد JSON صالحاً فقط بهذا الشكل:
+{{"works": [], "supplies": []}}
 
 القواعد:
 - works: الأعمال المنفذة والملاحظات العامة، كل بند جملة عربية مختصرة.
 - supplies: المواد الواردة للموقع. اذكر الصنف والكمية وحالة الاستلام إن وردت، مثل: حديد تسليح (مشرط) - 15 طن (تم الاستلام والتفريغ).
-- emails: رسائل البريد الإلكتروني الواردة، بصيغة: من: الجهة - ملخص الموضوع.
 - صحّح الأخطاء الإملائية الواضحة الناتجة عن التفريغ الصوتي.
 - لا تضف أي معلومة أو رقم أو جهة غير موجودة في الملاحظات.
 - إذا لم يوجد شيء لقائمة فاتركها فارغة.
@@ -202,7 +202,7 @@ def parse_report_json(text):
     if not isinstance(data, dict):
         return None
     out = {}
-    for key in ("works", "supplies", "emails"):
+    for key in ("works", "supplies"):
         v = data.get(key, [])
         out[key] = [str(x).strip() for x in v if str(x).strip()] if isinstance(v, list) else []
     return out
@@ -210,14 +210,10 @@ def parse_report_json(text):
 
 def classify_by_keywords(notes):
     """تصنيف احتياطي بسيط عند تعذر الذكاء الاصطناعي."""
-    mail_kw = ("إيميل", "ايميل", "بريد", "email", "mail")
     supply_kw = ("توريد", "استلام", "شاحنة", "شاحنات", "تفريغ")
-    out = {"works": [], "supplies": [], "emails": []}
+    out = {"works": [], "supplies": []}
     for n in notes:
-        low = n.lower()
-        if any(k in low for k in mail_kw):
-            out["emails"].append(n)
-        elif any(k in low for k in supply_kw):
+        if any(k in n for k in supply_kw):
             out["supplies"].append(n)
         else:
             out["works"].append(n)
@@ -226,7 +222,7 @@ def classify_by_keywords(notes):
 
 def build_report():
     """يبني بنود التقرير. يرجع (report, used_ai, error)."""
-    report = {"works": [], "supplies": [], "emails": []}
+    report = {"works": [], "supplies": []}
     used_ai, error = False, None
     notes = [n["text"] for n in site_notes]
 
@@ -241,7 +237,6 @@ def build_report():
             error = error or "تعذر قراءة رد الذكاء الاصطناعي."
 
     report["supplies"] = list(site_supplies) + report["supplies"]
-    report["emails"] = list(site_emails) + report["emails"]
     return report, used_ai, error
 
 
@@ -311,17 +306,6 @@ def icon_check(pdf, cx, cy):
     pdf.set_line_width(0.7)
     pdf.line(cx - 2.2, cy + 0.1, cx - 0.6, cy + 1.9)
     pdf.line(cx - 0.6, cy + 1.9, cx + 2.4, cy - 1.8)
-    reset_draw(pdf)
-
-
-def icon_mail(pdf, cx, cy):
-    w, h = 8, 5.5
-    x, y = cx - w / 2, cy - h / 2
-    pdf.set_draw_color(70, 70, 70)
-    pdf.set_line_width(0.4)
-    pdf.rect(x, y, w, h)
-    pdf.line(x, y, cx, cy + 0.5)
-    pdf.line(x + w, y, cx, cy + 0.5)
     reset_draw(pdf)
 
 
@@ -401,6 +385,12 @@ def image_size(path):
         return None
 
 
+def photo_caption(photo):
+    """التعليق أسفل الصورة: ما كتبته مع الصورة + تعليقك الصوتي المفرَّغ."""
+    parts = [p.strip() for p in (photo.get("caption"), photo.get("voice")) if p and p.strip()]
+    return " - ".join(parts) if parts else "صورة ميدانية"
+
+
 def draw_photo_row(pdf, pair):
     """صف صور: الأولى في العمود الأيمن والثانية في الأيسر، وتحت كل صورة تعليقها."""
     gap, img_h, cap_lh = 4, 62, 5.5
@@ -408,7 +398,7 @@ def draw_photo_row(pdf, pair):
     col_w = (pdf.epw - 3 * gap) / 2
 
     pdf.set_font(FONT_FAMILY, "", 11)
-    caps = [wrap_rtl(pdf, clean_text(p["caption"]), col_w - 2 * pdf.c_margin)[:3] for p in pair]
+    caps = [wrap_rtl(pdf, clean_text(photo_caption(p)), col_w - 2 * pdf.c_margin)[:4] for p in pair]
     cap_lines = max(len(c) for c in caps)
     h = gap + img_h + 2 + cap_lines * cap_lh + gap
 
@@ -498,15 +488,7 @@ def generate_pdf_report(report, photos_list):
         draw_row(pdf, "لا توجد توريدات مسجلة اليوم.")
     pdf.ln(4)
 
-    # 4) البريد الإلكتروني الوارد
-    section_bar(pdf, "البريد الإلكتروني الوارد (الإيميلات المستلمة)")
-    if report["emails"]:
-        for item in report["emails"]:
-            draw_row(pdf, item, icon_mail)
-    else:
-        draw_row(pdf, "لا يوجد بريد وارد مسجل اليوم.")
-
-    # 5) التوقيعات
+    # 4) التوقيعات
     draw_signatures(pdf)
 
     os.makedirs("reports", exist_ok=True)
@@ -525,8 +507,7 @@ def format_report_text(report):
     return (f"📋 تقرير نشاط الموقع اليومي\nالمشروع: {PROJECT_NAME}\n"
             f"التاريخ: {arabic_date(now_local().date())}\n"
             + block("🔧 الأعمال والملاحظات:", report["works"])
-            + block("✅ التوريدات:", report["supplies"])
-            + block("✉️ البريد الوارد:", report["emails"]))
+            + block("✅ التوريدات:", report["supplies"]))
 
 
 # ============================================================
@@ -535,10 +516,10 @@ def format_report_text(report):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🏗️ وكيل التقارير الميدانية - مشروع {PROJECT_NAME}\n\n"
-        "• أرسل ملاحظاتك نصاً أو تسجيلاً صوتياً (يُصنَّف تلقائياً إلى أعمال وتوريدات وبريد).\n"
-        "• أرسل الصور الميدانية مع تعليق عليها.\n"
+        "• أرسل ملاحظاتك نصاً أو تسجيلاً صوتياً (تُصنَّف تلقائياً إلى أعمال وتوريدات).\n"
+        "• أرسل الصورة ثم أرسل بعدها مباشرة تسجيلاً صوتياً ليصبح تعليقها أسفلها في التقرير "
+        "(أو اعمل Reply على الصورة بالتسجيل).\n"
         "• /supply نص التوريد  لتسجيل توريد صراحةً.\n"
-        "• /mail نص الرسالة  لتسجيل بريد وارد صراحةً.\n"
         "• /report لاستخراج التقرير اليومي وملف PDF.\n"
         "• /clear لبدء يوم جديد ومسح السجلات."
     )
@@ -547,7 +528,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     site_notes.append({"ts": now_local().strftime("%Y-%m-%d %H:%M"), "text": text})
+    last_photo["idx"] = None  # أي رسالة أخرى تقطع ربط الصوت بالصورة السابقة
     await update.message.reply_text(f"📝 تم تسجيل الملاحظة: '{text}'")
+
+
+def find_photo_for_voice(update, now):
+    """الصورة التي يعود إليها التسجيل: الصورة المردود عليها، أو آخر صورة أُرسلت قبله مباشرة."""
+    reply = update.message.reply_to_message
+    if reply:
+        for p in site_photos:
+            if p.get("msg_id") == reply.message_id:
+                return p
+    idx, at = last_photo["idx"], last_photo["at"]
+    if idx is not None and idx < len(site_photos) and at and (now - at).total_seconds() <= PHOTO_VOICE_WINDOW:
+        if not site_photos[idx].get("voice"):
+            return site_photos[idx]
+    return None
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -563,10 +559,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     transcribed_text, error = await asyncio.to_thread(transcribe_audio, file_path)
 
     if transcribed_text and transcribed_text.strip():
-        site_notes.append({"ts": now.strftime("%Y-%m-%d %H:%M"), "text": transcribed_text.strip()})
-        await update.message.reply_text(f"✅ تم تفريغ الملاحظة الصوتية:\n\n\"{transcribed_text}\"")
+        text = transcribed_text.strip()
+        photo = find_photo_for_voice(update, now)
+        if photo is not None:
+            photo["voice"] = text
+            n = site_photos.index(photo) + 1
+            await update.message.reply_text(f"✅ تم ربط التعليق الصوتي بالصورة رقم {n}:\n\n\"{text}\"")
+        else:
+            site_notes.append({"ts": now.strftime("%Y-%m-%d %H:%M"), "text": text})
+            await update.message.reply_text(f"✅ تم تفريغ الملاحظة الصوتية:\n\n\"{text}\"")
+        last_photo["idx"] = None
     else:
-        await update.message.reply_text(f"⚠️ تعذر تحويل الصوت إلى نص ولم تُسجَّل الملاحظة: {error}\nأعد الإرسال أو اكتبها نصاً.")
+        await update.message.reply_text(f"⚠️ تعذر تحويل الصوت إلى نص ولم يُسجَّل: {error}\nأعد الإرسال أو اكتبه نصاً.")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -577,9 +581,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_path = f"photos/photo_{len(site_photos) + 1}_{now.strftime('%H%M%S')}.jpg"
     await photo_file.download_to_drive(file_path)
 
-    caption = update.message.caption or "صورة ميدانية"
-    site_photos.append({"path": file_path, "caption": caption, "timestamp": now.strftime("%Y-%m-%d %H:%M")})
-    await update.message.reply_text(f"📸 تم حفظ الصورة: '{caption}'")
+    caption = (update.message.caption or "").strip()
+    site_photos.append({
+        "path": file_path,
+        "caption": caption,
+        "voice": "",
+        "timestamp": now.strftime("%Y-%m-%d %H:%M"),
+        "msg_id": update.message.message_id,
+    })
+    last_photo["idx"], last_photo["at"] = len(site_photos) - 1, now
+    await update.message.reply_text(
+        f"📸 تم حفظ الصورة رقم {len(site_photos)}. أرسل الآن تسجيلاً صوتياً ليصبح تعليقها أسفلها.")
 
 
 async def supply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -588,20 +600,12 @@ async def supply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("اكتب التوريد بعد الأمر، مثال:\n/supply حديد تسليح (مشرط) - 15 طن (تم الاستلام والتفريغ)")
         return
     site_supplies.append(text)
+    last_photo["idx"] = None
     await update.message.reply_text(f"✅ تم تسجيل التوريد: '{text}'")
 
 
-async def mail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.partition(" ")[2].strip()
-    if not text:
-        await update.message.reply_text("اكتب الرسالة بعد الأمر، مثال:\n/mail من: الاستشاري - اعتماد تعديلات المخططات الإنشائية")
-        return
-    site_emails.append(text)
-    await update.message.reply_text(f"✉️ تم تسجيل البريد الوارد: '{text}'")
-
-
 async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not (site_notes or site_photos or site_supplies or site_emails):
+    if not (site_notes or site_photos or site_supplies):
         await update.message.reply_text("⚠️ لا توجد أي ملاحظات أو صور مسجلة حتى الآن اليوم.")
         return
 
@@ -635,7 +639,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     site_notes.clear()
     site_photos.clear()
     site_supplies.clear()
-    site_emails.clear()
+    last_photo.update(idx=None, at=None)
     await update.message.reply_text("🧹 تم مسح سجلات اليوم وبدء سجل جديد.")
 
 
@@ -648,7 +652,6 @@ if __name__ == "__main__":
         app.add_handler(CommandHandler("report", handle_report))
         app.add_handler(CommandHandler("clear", clear_command))
         app.add_handler(CommandHandler("supply", supply_command))
-        app.add_handler(CommandHandler("mail", mail_command))
         app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
         app.add_handler(MessageHandler(filters.VOICE, handle_voice))
         app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
