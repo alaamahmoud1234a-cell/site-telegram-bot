@@ -54,6 +54,16 @@ GROQ_API_KEY = (os.environ.get("GROQ_API_KEY") or "").strip()
 # اسم المشروع (يمكن تغييره من متغير بيئة PROJECT_NAME في Render)
 PROJECT_NAME = (os.environ.get("PROJECT_NAME") or "مكادي مول").strip()
 
+# اسم مهندس الموقع صاحب هذه النسخة (متغير بيئة ENGINEER_NAME) - يظهر في الـ PDF
+ENGINEER_NAME = (os.environ.get("ENGINEER_NAME") or "").strip()
+
+# معرّف تليجرام الرقمي لمدير المشروع: تصله نسخة تلقائية من كل تقرير (اختياري)
+_admin = re.findall(r"-?\d+", os.environ.get("ADMIN_TELEGRAM_ID") or "")
+ADMIN_TELEGRAM_ID = int(_admin[0]) if _admin else None
+
+# معرّفات تليجرام المسموح لها باستخدام البوت (اختياري، مفصولة بفواصل). فارغ = متاح للجميع
+ALLOWED_USER_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ALLOWED_USER_IDS") or "")}
+
 ANTHROPIC_MODEL = (os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-5-5").strip()
 ANTHROPIC_FALLBACKS = ["claude-haiku-5-5"]
 GROQ_BASE = "https://api.groq.com/openai/v1"
@@ -327,6 +337,9 @@ def draw_header(pdf):
     pdf.cell(half, 7, ar("تقرير يومية موقع إنشاءات"), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
     pdf.set_font(FONT_FAMILY, "B", 13)
     pdf.cell(0, 8, ar(f"اسم المشروع: {PROJECT_NAME}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
+    if ENGINEER_NAME:
+        pdf.set_font(FONT_FAMILY, "", 12)
+        pdf.cell(0, 7, ar(f"مهندس الموقع: {ENGINEER_NAME}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
     pdf.ln(1)
     y = pdf.get_y()
     pdf.set_line_width(0.5)
@@ -445,6 +458,10 @@ def draw_signatures(pdf):
         pdf.set_font(FONT_FAMILY, "B", 12)
         pdf.set_xy(bx, y + 2)
         pdf.cell(bw, 7, ar(label), align="R")
+        if i == 0 and ENGINEER_NAME:
+            pdf.set_font(FONT_FAMILY, "", 11)
+            pdf.set_xy(bx, y + h - 9)
+            pdf.cell(bw, 7, ar(ENGINEER_NAME), align="R")
     reset_draw(pdf)
     pdf.set_xy(x0, y + h)
 
@@ -631,8 +648,31 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 read_timeout=60,
                 write_timeout=60,
             )
+        await forward_to_admin(update, context, text, pdf_path)
     except Exception as pdf_err:
         await update.message.reply_text(f"⚠️ تم إرسال التقرير النصي، وتوقف الـ PDF بسبب: {pdf_err}")
+
+
+async def forward_to_admin(update, context, text, pdf_path):
+    """إرسال نسخة من التقرير تلقائياً لمدير المشروع (ADMIN_TELEGRAM_ID)."""
+    if not ADMIN_TELEGRAM_ID or ADMIN_TELEGRAM_ID == update.effective_chat.id:
+        return
+    try:
+        eng = ENGINEER_NAME or f"@{context.bot.username}"
+        notice = f"🔔 تقرير جديد من: {eng}\n🏗️ المشروع: {PROJECT_NAME}\n\n" + text
+        for i in range(0, len(notice), 4000):
+            await context.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=notice[i:i + 4000])
+        with open(pdf_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=ADMIN_TELEGRAM_ID,
+                document=f,
+                filename=os.path.basename(pdf_path),
+                caption=f"📄 نسخة مدير المشروع - تقرير {eng}",
+                read_timeout=60,
+                write_timeout=60,
+            )
+    except Exception as e:
+        print("Failed to forward report to admin:", e)
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -648,13 +688,15 @@ if __name__ == "__main__":
         print("Error: TELEGRAM_BOT_TOKEN is not set.")
     else:
         app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-        app.add_handler(CommandHandler("start", start_command))
-        app.add_handler(CommandHandler("report", handle_report))
-        app.add_handler(CommandHandler("clear", clear_command))
-        app.add_handler(CommandHandler("supply", supply_command))
-        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-        app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-        app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        # تقييد الاستخدام بمعرّفات محددة إن ضُبط ALLOWED_USER_IDS، وإلا يعمل للجميع
+        access = filters.User(user_id=list(ALLOWED_USER_IDS)) if ALLOWED_USER_IDS else filters.ALL
+        app.add_handler(CommandHandler("start", start_command, filters=access))
+        app.add_handler(CommandHandler("report", handle_report, filters=access))
+        app.add_handler(CommandHandler("clear", clear_command, filters=access))
+        app.add_handler(CommandHandler("supply", supply_command, filters=access))
+        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & access, handle_text))
+        app.add_handler(MessageHandler(filters.VOICE & access, handle_voice))
+        app.add_handler(MessageHandler(filters.PHOTO & access, handle_photo))
 
         print("=== بوت تليجرام يعمل الآن ومستعد لاستقبال النص والصوت والصور ===")
         app.run_polling()
