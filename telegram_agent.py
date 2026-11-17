@@ -7,8 +7,9 @@ import datetime
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
+                          filters, ContextTypes)
 import anthropic
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
@@ -926,29 +927,304 @@ def format_report_text(report):
 
 
 # ============================================================
+# 5b. الحالة اليومية والتذكيرات وملخص الصباح والأزرار
+# ============================================================
+# إعدادات اختيارية (متغيرات بيئة في Render، ولها قيم افتراضية):
+#   REMINDER_TIME          موعد تذكير نهاية الدوام للمهندس      الافتراضي 17:00
+#   MORNING_SUMMARY_TIME   موعد ملخص الصباح لمدير المشروع       الافتراضي 08:00
+#   OFF_DAYS               أيام الإجازة مفصولة بفواصل           الافتراضي الجمعة
+def _parse_hhmm(value, default):
+    m = re.match(r"^\s*(\d{1,2})[:.](\d{2})\s*$", (value or "").translate(EN_DIGITS))
+    if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:
+        return datetime.time(int(m.group(1)), int(m.group(2)))
+    return default
+
+
+def _norm_ar(s):
+    return re.sub("[أإآ]", "ا", s or "").replace("ى", "ي").strip()
+
+
+def _parse_off_days(value):
+    names = {_norm_ar(n): i for i, n in enumerate(DAYS_AR)}
+    out = set()
+    for tok in re.split(r"[,،\s]+", value or ""):
+        if _norm_ar(tok) in names:
+            out.add(names[_norm_ar(tok)])
+    return out
+
+
+REMINDER_TIME = _parse_hhmm(os.environ.get("REMINDER_TIME"), datetime.time(17, 0))
+MORNING_SUMMARY_TIME = _parse_hhmm(os.environ.get("MORNING_SUMMARY_TIME"), datetime.time(8, 0))
+_off_env = os.environ.get("OFF_DAYS")
+OFF_DAYS = _parse_off_days(_off_env if _off_env is not None else "الجمعة")
+REMINDER_GRACE_MIN = 120   # إن استيقظ البوت بعد الموعد بأكثر من ذلك لا يُرسل تذكيراً متأخراً
+SUMMARY_GRACE_MIN = 240
+
+STATE_FILE = os.path.join("data", "state.json")
+# tracking_since: متى بدأ البوت يسجّل الحالة (يُصفَّر إن ضاع الملف عند إعادة التشغيل)
+# chat_ids: محادثات المهندس التي يرسل لها التذكير | days: حالة كل يوم | fired: آخر يوم أُرسل فيه كل تنبيه
+STATE = {"tracking_since": "", "chat_ids": [], "days": {}, "fired": {}}
+
+
+def save_state():
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        cutoff = (now_local().date() - datetime.timedelta(days=21)).isoformat()
+        STATE["days"] = {k: v for k, v in STATE["days"].items() if k >= cutoff}
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(STATE, f, ensure_ascii=False)
+    except Exception as e:
+        print("State save error:", e)
+
+
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for key in ("chat_ids", "days", "fired"):
+                    if isinstance(data.get(key), type(STATE[key])):
+                        STATE[key] = data[key]
+                if isinstance(data.get("tracking_since"), str):
+                    STATE["tracking_since"] = data["tracking_since"]
+    except Exception as e:
+        print("State load error:", e)
+    if not STATE["tracking_since"]:
+        STATE["tracking_since"] = now_local().isoformat(timespec="minutes")
+        save_state()
+
+
+def remember_chat(chat_id):
+    """يتعلّم البوت محادثة المهندس تلقائياً ليرسل لها التذكير (ولا يضيف المدير)."""
+    if chat_id and chat_id > 0 and chat_id != ADMIN_TELEGRAM_ID and chat_id not in STATE["chat_ids"]:
+        STATE["chat_ids"].append(chat_id)
+        save_state()
+
+
+def reminder_targets():
+    ids = sorted(ALLOWED_USER_IDS) if ALLOWED_USER_IDS else list(STATE["chat_ids"])
+    return [i for i in ids if i != ADMIN_TELEGRAM_ID]  # المدير لا يصله تذكير المهندس
+
+
+_PRIORITY_RANK = {"عالية": 0, "متوسطة": 1, "منخفضة": 2}
+
+
+def top_issue_texts(report, limit=2):
+    issues = sorted(report.get("issues", []), key=lambda i: _PRIORITY_RANK.get(_s(i.get("priority")), 3))
+    out = []
+    for i in issues:
+        d = _s(i.get("description"))
+        if d:
+            out.append(d if len(d) <= 70 else d[:67] + "...")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def day_status(date_iso):
+    return (STATE["days"].get(date_iso) or {}).get("status", "")
+
+
+def record_report_day(report):
+    STATE["days"][now_local().date().isoformat()] = {
+        "status": "sent", "number": int(report.get("number") or 0), "issues": top_issue_texts(report)}
+    save_state()
+
+
+def record_no_work_day():
+    STATE["days"][now_local().date().isoformat()] = {"status": "no_work"}
+    save_state()
+
+
+def today_counts():
+    t = now_local().date().isoformat()
+    return (sum(1 for n in site_notes if n["ts"][:10] == t),
+            sum(1 for p in site_photos if p["timestamp"][:10] == t))
+
+
+def reminder_text():
+    notes, photos = today_counts()
+    if notes or photos:
+        body = f"سجّلت اليوم {notes} ملاحظة و{photos} صورة، ولم تُصدر التقرير بعد."
+    else:
+        body = "لم تسجّل أي ملاحظات أو صور اليوم، ولم يُصدر تقرير."
+    return (f"⏰ تذكير نهاية الدوام - {PROJECT_NAME}\n\n{body}\n"
+            "اضغط «إصدار التقرير الآن»، أو سجّل ما تبقى أولاً. "
+            "وإن لم يكن هناك عمل اليوم فاضغط «لا عمل اليوم».")
+
+
+def reminder_markup():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📄 إصدار التقرير الآن", callback_data="do_report"),
+        InlineKeyboardButton("🚫 لا عمل اليوم", callback_data="no_work"),
+    ]])
+
+
+def last_workday_before(today):
+    d = today - datetime.timedelta(days=1)
+    for _ in range(7):
+        if d.weekday() not in OFF_DAYS:
+            return d
+        d -= datetime.timedelta(days=1)
+    return today - datetime.timedelta(days=1)
+
+
+def tracking_started_after(date_obj):
+    """هل بدأ التتبع بعد بداية ذلك اليوم؟ (إذن قد تكون سجلاته ضاعت)."""
+    try:
+        since = datetime.datetime.fromisoformat(STATE["tracking_since"])
+        start = datetime.datetime.combine(date_obj, datetime.time(0, 0), tzinfo=since.tzinfo)
+        return since > start
+    except Exception:
+        return False
+
+
+def morning_summary_text(report_date, eng):
+    rec = STATE["days"].get(report_date.isoformat()) or {}
+    status = rec.get("status", "")
+    head = f"📊 {eng} - {day_and_date(report_date)}: "
+    if status == "sent":
+        head += f"✅ أُرسل التقرير رقم {int(rec.get('number') or 0):03d}"
+        issues = rec.get("issues") or []
+        line2 = ("⚠️ أهم المعوقات: " + "؛ ".join(issues)) if issues else "✅ لا معوقات مسجلة."
+    elif status == "no_work":
+        head += "🚫 لا عمل"
+        line2 = "—"
+    elif tracking_started_after(report_date):
+        head += "❔ غير معروف (أُعيد تشغيل البوت وضاعت سجلات ذلك اليوم)"
+        line2 = "لا بيانات متاحة."
+    else:
+        head += "❌ لم يُرسل التقرير"
+        line2 = "لا بيانات لهذا اليوم."
+    return head + "\n" + line2
+
+
+def _due(target_time, fired_key, now, grace_min):
+    if STATE["fired"].get(fired_key) == now.date().isoformat():
+        return False
+    target = datetime.datetime.combine(now.date(), target_time, tzinfo=now.tzinfo)
+    return 0 <= (now - target).total_seconds() / 60 <= grace_min
+
+
+async def scheduler_tick(bot):
+    now = now_local()
+    today = now.date()
+    if today.weekday() in OFF_DAYS:
+        return
+
+    # 1) تذكير نهاية الدوام للمهندس إن لم يُصدر تقريره
+    if _due(REMINDER_TIME, "reminder", now, REMINDER_GRACE_MIN):
+        targets = reminder_targets()
+        if targets:
+            STATE["fired"]["reminder"] = today.isoformat()
+            save_state()
+            if not day_status(today.isoformat()):
+                for chat_id in targets:
+                    try:
+                        await bot.send_message(chat_id=chat_id, text=reminder_text(),
+                                               reply_markup=reminder_markup())
+                    except Exception as e:
+                        print("Reminder failed:", e)
+
+    # 2) ملخص الصباح لمدير المشروع عن آخر يوم عمل
+    if ADMIN_TELEGRAM_ID and _due(MORNING_SUMMARY_TIME, "summary", now, SUMMARY_GRACE_MIN):
+        STATE["fired"]["summary"] = today.isoformat()
+        save_state()
+        eng = ENGINEER_NAME or f"@{bot.username}"
+        try:
+            await bot.send_message(chat_id=ADMIN_TELEGRAM_ID,
+                                   text=morning_summary_text(last_workday_before(today), eng))
+        except Exception as e:
+            print("Morning summary failed:", e)
+
+
+async def scheduler_loop(bot):
+    while True:
+        try:
+            await scheduler_tick(bot)
+        except Exception as e:
+            print("Scheduler error:", e)
+        await asyncio.sleep(30)
+
+
+async def post_init(app):
+    app.bot_data["scheduler_task"] = asyncio.create_task(scheduler_loop(app.bot))
+
+
+# ----- أزرار سريعة أسفل الشاشة -----
+BTN_LABOR = "👷 عمالة"
+BTN_SUPPLY = "📦 توريد"
+BTN_ISSUE = "⚠️ معوق أو طلب"
+BTN_REPORT = "📄 إصدار التقرير"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup([[BTN_LABOR, BTN_SUPPLY], [BTN_ISSUE, BTN_REPORT]], resize_keyboard=True)
+
+BUTTON_TAGS = {
+    BTN_LABOR: ("عمالة", "👷 اكتب أو سجّل صوتياً بيانات العمالة الآن (رسالة واحدة).\n"
+                         "مثال: نجارون 6 وحدادون 4 وعمال 10، ومقاول الباطن 8 عمال"),
+    BTN_SUPPLY: ("توريد", "📦 اكتب أو سجّل صوتياً بيانات التوريد الآن (رسالة واحدة).\n"
+                          "مثال: حديد تسليح 15 طن - المورد: الشركة المصرية - تم الاستلام والتفريغ"),
+    BTN_ISSUE: ("معوق", "⚠️ اكتب أو سجّل صوتياً المعوق أو الطلب الآن (رسالة واحدة).\n"
+                        "مثال: تأخر وصول الخرسانة ساعتين - المطلوب تغيير المورد قبل الخميس - أولوية عالية"),
+}
+AWAITING_WINDOW = 600  # ثوانٍ: مهلة وصول رسالة المهندس بعد ضغط الزر
+
+
+def pop_awaiting(context):
+    """القسم الذي ضغط المهندس زره قبل رسالته (يُستهلك مرة واحدة وخلال 10 دقائق)."""
+    a = context.user_data.pop("awaiting", None)
+    if a and (now_local() - a["at"]).total_seconds() <= AWAITING_WINDOW:
+        return a["tag"]
+    return None
+
+
+load_state()
+
+
+# ============================================================
 # 6. معالجات تليجرام
 # ============================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    drive_note = " (وتُؤرشف نسخة منه مع الصور في Google Drive تلقائياً)" if GOOGLE_DRIVE_WEBHOOK_URL else ""
     await update.message.reply_text(
         f"🏗️ وكيل التقارير الميدانية - مشروع {PROJECT_NAME}\n\n"
         "كل الأقسام اختيارية: سجّل ما يخص يومك فقط، وما لا تسجله لا يظهر في التقرير.\n\n"
-        "• أرسل ملاحظاتك نصاً أو صوتاً بحرية (أعمال، كميات، عمالة، معدات، توريدات، معوقات، طقس) "
-        "وسيُصنَّف تلقائياً.\n"
+        "• أزرار سريعة أسفل الشاشة: اضغط «عمالة» أو «توريد» أو «معوق»، ثم اكتب أو سجّل صوتياً "
+        "رسالة واحدة وستُسجَّل في قسمها.\n"
+        "• أو أرسل ملاحظاتك نصاً أو صوتاً بحرية وسيُصنَّف تلقائياً.\n"
         "• أرسل الصورة ثم تسجيلاً صوتياً بعدها مباشرة ليصبح تعليقها أسفلها "
         "(أو اعمل Reply على الصورة بالتسجيل).\n"
-        "• أوامر اختيارية لتحديد القسم صراحةً:\n"
-        "   /supply توريد    /labor عمالة    /issue معوق أو طلب    /weather طقس\n"
-        "• /report لاستخراج التقرير اليومي وملف PDF"
-        + (" (وتُؤرشف نسخة منه مع الصور في Google Drive تلقائياً)" if GOOGLE_DRIVE_WEBHOOK_URL else "") + ".\n"
-        "• /clear لبدء يوم جديد ومسح السجلات."
+        "• أوامر اختيارية: /supply /labor /issue /weather\n"
+        f"• /report أو زر «إصدار التقرير» لاستخراج التقرير اليومي وملف PDF{drive_note}.\n"
+        "• /clear لبدء يوم جديد ومسح السجلات.\n\n"
+        f"⏰ إن لم تُصدر تقريرك حتى {REMINDER_TIME.strftime('%H:%M')} يصلك تذكير.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    site_notes.append({"ts": now_local().strftime("%Y-%m-%d %H:%M"), "text": text})
+    text = update.message.text.strip()
+
+    if text == BTN_REPORT:
+        context.user_data.pop("awaiting", None)
+        await handle_report(update, context)
+        return
+    if text in BUTTON_TAGS:
+        tag, prompt = BUTTON_TAGS[text]
+        context.user_data["awaiting"] = {"tag": tag, "at": now_local()}
+        last_photo["idx"] = None
+        await update.message.reply_text(prompt, reply_markup=MAIN_KEYBOARD)
+        return
+
+    tag = pop_awaiting(context)
+    site_notes.append({"ts": now_local().strftime("%Y-%m-%d %H:%M"),
+                       "text": f"[{tag}] {text}" if tag else text})
     last_photo["idx"] = None  # أي رسالة أخرى تقطع ربط الصوت بالصورة السابقة
-    await update.message.reply_text(f"📝 تم تسجيل الملاحظة: '{text}'")
+    if tag:
+        await update.message.reply_text(f"✅ تم تسجيل ({tag}): '{text}'")
+    else:
+        await update.message.reply_text(f"📝 تم تسجيل الملاحظة: '{text}'")
 
 
 def find_photo_for_voice(update, now):
@@ -979,20 +1255,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if transcribed_text and transcribed_text.strip():
         text = transcribed_text.strip()
-        photo = find_photo_for_voice(update, now)
+        tag = pop_awaiting(context)
+        photo = None if tag else find_photo_for_voice(update, now)
         if photo is not None:
             photo["voice"] = text
             n = site_photos.index(photo) + 1
             await update.message.reply_text(f"✅ تم ربط التعليق الصوتي بالصورة رقم {n}:\n\n\"{text}\"")
         else:
-            site_notes.append({"ts": now.strftime("%Y-%m-%d %H:%M"), "text": text})
-            await update.message.reply_text(f"✅ تم تفريغ الملاحظة الصوتية:\n\n\"{text}\"")
+            site_notes.append({"ts": now.strftime("%Y-%m-%d %H:%M"),
+                               "text": f"[{tag}] {text}" if tag else text})
+            label = f"✅ تم تسجيل ({tag}):" if tag else "✅ تم تفريغ الملاحظة الصوتية:"
+            await update.message.reply_text(f"{label}\n\n\"{text}\"")
         last_photo["idx"] = None
     else:
         await update.message.reply_text(f"⚠️ تعذر تحويل الصوت إلى نص ولم يُسجَّل: {error}\nأعد الإرسال أو اكتبه نصاً.")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("awaiting", None)  # الصورة تقطع انتظار زر القسم
     photo_file = await update.message.photo[-1].get_file()
     os.makedirs("photos", exist_ok=True)
 
@@ -1035,11 +1315,12 @@ TAG_COMMANDS = [
 
 
 async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message  # يعمل مع الأمر ومع زر «إصدار التقرير» في التذكير
     if not (site_notes or site_photos):
-        await update.message.reply_text("⚠️ لا توجد أي ملاحظات أو صور مسجلة حتى الآن اليوم.")
+        await msg.reply_text("⚠️ لا توجد أي ملاحظات أو صور مسجلة حتى الآن اليوم.")
         return
 
-    await update.message.reply_text("⏳ جاري تصنيف الملاحظات وتوليد التقرير وملف الـ PDF...")
+    await msg.reply_text("⏳ جاري تصنيف الملاحظات وتوليد التقرير وملف الـ PDF...")
 
     report, used_ai, err = await asyncio.to_thread(build_report)
     if err:
@@ -1049,12 +1330,14 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not used_ai and site_notes:
         text += "\n\n(تم التصنيف تلقائياً بدون الذكاء الاصطناعي، راجع البنود.)"
     for i in range(0, len(text), 4000):
-        await update.message.reply_text(text[i:i + 4000])
+        await msg.reply_text(text[i:i + 4000])
+
+    record_report_day(report)  # يوقف تذكير اليوم ويغذّي ملخص الصباح
 
     try:
         pdf_path = await asyncio.to_thread(generate_pdf_report, report, list(site_photos))
         with open(pdf_path, "rb") as pdf_file:
-            await update.message.reply_document(
+            await msg.reply_document(
                 document=pdf_file,
                 filename=os.path.basename(pdf_path),
                 caption=f"📄 تقرير نشاط الموقع اليومي رقم {report['number']:03d} - {PROJECT_NAME}",
@@ -1065,10 +1348,10 @@ async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if GOOGLE_DRIVE_WEBHOOK_URL:
             drive = await asyncio.to_thread(upload_report_to_drive, pdf_path, os.path.basename(pdf_path),
                                             list(site_photos), now_local().date().isoformat())
-            await update.message.reply_text(drive_status_text(drive))
+            await msg.reply_text(drive_status_text(drive))
         await forward_to_admin(update, context, text, pdf_path, missing_sections(report, len(site_photos)), drive)
     except Exception as pdf_err:
-        await update.message.reply_text(f"⚠️ تم إرسال التقرير النصي، وتوقف الـ PDF بسبب: {pdf_err}")
+        await msg.reply_text(f"⚠️ تم إرسال التقرير النصي، وتوقف الـ PDF بسبب: {pdf_err}")
 
 
 async def forward_to_admin(update, context, text, pdf_path, missing, drive=None):
@@ -1108,13 +1391,50 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 تم مسح سجلات اليوم وبدء سجل جديد.")
 
 
+async def track_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يتعلّم محادثة المهندس تلقائياً (لا يمنع بقية المعالجات)."""
+    chat = update.effective_chat
+    if chat and chat.type == "private":
+        remember_chat(chat.id)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أزرار رسالة التذكير: إصدار التقرير الآن / لا عمل اليوم."""
+    q = update.callback_query
+    uid = q.from_user.id if q.from_user else None
+    if ALLOWED_USER_IDS and uid not in ALLOWED_USER_IDS:
+        await q.answer("غير مصرّح لك باستخدام هذا البوت.")
+        return
+
+    if q.data == "do_report":
+        await q.answer()
+        await handle_report(update, context)
+    elif q.data == "no_work":
+        today = now_local().date()
+        sent_date = q.message.date.astimezone(now_local().tzinfo).date() if q.message else today
+        if sent_date != today:
+            await q.answer("انتهت صلاحية هذا الزر (تذكير ليوم سابق).", show_alert=True)
+        elif day_status(today.isoformat()) == "sent":
+            await q.answer("أُصدر تقرير اليوم بالفعل.", show_alert=True)
+        else:
+            record_no_work_day()
+            await q.answer("تم التسجيل")
+            try:
+                await q.edit_message_text("🚫 تم تسجيل: لا عمل اليوم. لن تصلك تذكيرات أخرى اليوم.")
+            except Exception:
+                pass
+    else:
+        await q.answer()
+
+
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN is not set.")
     else:
-        app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
         # تقييد الاستخدام بمعرّفات محددة إن ضُبط ALLOWED_USER_IDS، وإلا يعمل للجميع
         access = filters.User(user_id=list(ALLOWED_USER_IDS)) if ALLOWED_USER_IDS else filters.ALL
+        app.add_handler(MessageHandler(access, track_chat), group=-1)
         app.add_handler(CommandHandler("start", start_command, filters=access))
         app.add_handler(CommandHandler("report", handle_report, filters=access))
         app.add_handler(CommandHandler("clear", clear_command, filters=access))
@@ -1123,6 +1443,9 @@ if __name__ == "__main__":
         app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & access, handle_text))
         app.add_handler(MessageHandler(filters.VOICE & access, handle_voice))
         app.add_handler(MessageHandler(filters.PHOTO & access, handle_photo))
+        app.add_handler(CallbackQueryHandler(on_callback))
 
+        off = "، ".join(DAYS_AR[i] for i in sorted(OFF_DAYS)) or "لا يوجد"
+        print(f"التذكير {REMINDER_TIME:%H:%M} | ملخص الصباح {MORNING_SUMMARY_TIME:%H:%M} | الإجازة: {off}")
         print("=== بوت تليجرام يعمل الآن ومستعد لاستقبال النص والصوت والصور ===")
         app.run_polling()
