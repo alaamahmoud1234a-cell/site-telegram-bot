@@ -1158,7 +1158,11 @@ BTN_SUPPLY = "📦 توريد"
 BTN_ISSUE = "⚠️ معوق أو طلب"
 BTN_REPORT = "📄 إصدار التقرير"
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup([[BTN_LABOR, BTN_SUPPLY], [BTN_ISSUE, BTN_REPORT]], resize_keyboard=True)
+_KEYS = [[BTN_LABOR, BTN_SUPPLY], [BTN_ISSUE, BTN_REPORT]]
+try:  # لوحة دائمة: لا تختفي بعد الاستخدام وتبقى طوال اليوم
+    MAIN_KEYBOARD = ReplyKeyboardMarkup(_KEYS, resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
+except TypeError:  # نسخ python-telegram-bot القديمة بلا is_persistent
+    MAIN_KEYBOARD = ReplyKeyboardMarkup(_KEYS, resize_keyboard=True, one_time_keyboard=False)
 
 BUTTON_TAGS = {
     BTN_LABOR: ("عمالة", "👷 اكتب أو سجّل صوتياً بيانات العمالة الآن (رسالة واحدة).\n"
@@ -1222,9 +1226,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        "text": f"[{tag}] {text}" if tag else text})
     last_photo["idx"] = None  # أي رسالة أخرى تقطع ربط الصوت بالصورة السابقة
     if tag:
-        await update.message.reply_text(f"✅ تم تسجيل ({tag}): '{text}'")
+        await update.message.reply_text(f"✅ تم تسجيل ({tag}): '{text}'", reply_markup=MAIN_KEYBOARD)
     else:
-        await update.message.reply_text(f"📝 تم تسجيل الملاحظة: '{text}'")
+        await update.message.reply_text(f"📝 تم تسجيل الملاحظة: '{text}'", reply_markup=MAIN_KEYBOARD)
 
 
 def find_photo_for_voice(update, now):
@@ -1260,12 +1264,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if photo is not None:
             photo["voice"] = text
             n = site_photos.index(photo) + 1
-            await update.message.reply_text(f"✅ تم ربط التعليق الصوتي بالصورة رقم {n}:\n\n\"{text}\"")
+            await update.message.reply_text(f"✅ تم ربط التعليق الصوتي بالصورة رقم {n}:\n\n\"{text}\"",
+                                            reply_markup=MAIN_KEYBOARD)
         else:
             site_notes.append({"ts": now.strftime("%Y-%m-%d %H:%M"),
                                "text": f"[{tag}] {text}" if tag else text})
             label = f"✅ تم تسجيل ({tag}):" if tag else "✅ تم تفريغ الملاحظة الصوتية:"
-            await update.message.reply_text(f"{label}\n\n\"{text}\"")
+            await update.message.reply_text(f"{label}\n\n\"{text}\"", reply_markup=MAIN_KEYBOARD)
         last_photo["idx"] = None
     else:
         await update.message.reply_text(f"⚠️ تعذر تحويل الصوت إلى نص ولم يُسجَّل: {error}\nأعد الإرسال أو اكتبه نصاً.")
@@ -1388,7 +1393,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     site_notes.clear()
     site_photos.clear()
     last_photo.update(idx=None, at=None)
-    await update.message.reply_text("🧹 تم مسح سجلات اليوم وبدء سجل جديد.")
+    await update.message.reply_text("🧹 تم مسح سجلات اليوم وبدء سجل جديد.", reply_markup=MAIN_KEYBOARD)
 
 
 async def track_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
